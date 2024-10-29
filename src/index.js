@@ -1,7 +1,12 @@
 const { init, compress, decompress } = require('@bokuweb/zstd-wasm');
 
+// File name of the current dictionary asset (TODO: see if there is a way to get this dynamically)
 const currentDictionary = "HWl0A6pNEHO4AeCdArQj53JlvZKN8Fcwk3JcGv3tak8";
+
+// Psuedo-path where the dictionaries will be served from (shouldn't collide with a real directory)
 const dictionaryPath = "/dictionary/";
+
+// Match pattern for the URLs to be compressed
 const match = 'match="/*", match-dest=("document" "frame")';
 
 // Globals for managing state while waiting for the dictionary to load
@@ -36,7 +41,7 @@ export default {
       }
       return new Response(body, {
         headers: {
-          "content-type": "text/plain; charset=UTF-8",
+          "content-type": "text/plain; charset=UTF-8",  /* Can be anything but text/plain will allow for Cloudflare to apply compression */
           "cache-control": "public, max-age=604800",
           "use-as-dictionary": match
         }
