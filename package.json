@@ -1,8 +1,5 @@
 {
   "devDependencies": {
     "wrangler": "^3.83.0"
-  },
-  "dependencies": {
-    "@bokuweb/zstd-wasm": "^0.0.21-alpha.5"
   }
 }

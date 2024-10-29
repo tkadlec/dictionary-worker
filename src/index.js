@@ -1,4 +1,8 @@
-const { init, compress, decompress } = require('@bokuweb/zstd-wasm');
+import zstdlib from "../zstd-wasm-compress/bin/zstdlib.js";
+import zstdwasm from "../zstd-wasm-compress/bin/zstdlib.wasm";
+
+// Keep a global instance of the zstd wasm to use across requests
+let zstd = null;
 
 // File name of the current dictionary asset (TODO: see if there is a way to get this dynamically)
 const currentDictionary = "HWl0A6pNEHO4AeCdArQj53JlvZKN8Fcwk3JcGv3tak8";
@@ -88,10 +92,41 @@ async function fetchDictionary(request, env) {
       } else {
         dictionary = false;
       }
+
+      // init zstandard
+      await zstd_init();
+
       resolve(true);
     } else {
       await dictionaryPromise;
     }
   }
   return dictionary !== null;
+}
+
+// wasm setup
+async function zstd_init() {
+  // we send our own instantiateWasm function
+  // to the zstdlib module
+  // so we can initialize the WASM instance ourselves
+  // since Workers puts your wasm file in global scope
+  // as a binding. In this case, this binding is called
+  // `wasm` as that is the name Wrangler uses
+  // for any uploaded wasm module
+  if (!zstd) {
+    zstd = await zstdlib({
+      instantiateWasm(info, receive) {
+        console.log("instantiateWasm");
+        let instance = new WebAssembly.Instance(zstdwasm, info);
+        receive(instance);
+        return instance.exports;
+      },
+      locateFile(path, scriptDirectory) {
+        // scriptDirectory is undefined, so this is a
+        // no-op to avoid exception "TypeError: Invalid URL string."
+        console.log("locateFile");
+        return path
+      },
+    });
+  }
 }
