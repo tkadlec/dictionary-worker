@@ -1,0 +1,5 @@
+This folder holds the dictionary to be used to compress HTML assets and `build.sh` should be run any time it changes.
+
+The dictionaries can be generated using the [online dictionary generator](https://use-as-dictionary.com/generate/) or with the [dictionary_generator](https://github.com/google/brotli/tree/master/research) from brotli (or any other mechanism).
+
+The dictionary will be renamed based on the sha256 hash of the contents of the dictionary which is what compression dictionary transport uses for negotiating the dictionaries. The file name is a base64URL-encoded version of the sha256 hash (which is the same as base64 but with `-` used in place of `+`, `_` used in place of `/`, and any `=` padding removed). Compression dictionary transport uses base64-encoding for the hash in the HTTP headers which makes the conversion to the file names a simple string substitution.

@@ -1,0 +1,13 @@
+name = "roadtrip-dictionary"
+main = "src/index.js"
+compatibility_flags = [ "nodejs_compat" ]
+compatibility_date = "2024-10-29"
+assets = { directory = "./assets/", binding = "ASSETS", html_handling = "none", not_found_handling = "none" }
+account_id = "63646222aa5ce1674c031721cf9f6db5"
+env = { }
+workers_dev = false
+route = {pattern = "roadtrip.meenan.us/*", zone_id = "c7d12302659eff5de51fbc184af8b4fc"}
+
+[observability]
+enabled = true
+head_sampling_rate = 1
