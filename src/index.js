@@ -62,7 +62,15 @@ export default {
         const response = new Response(original.body, original);
         response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
 
-        // TODO: compress the response with the dictionary if it is available
+        await zstd_init();
+        if (zstd !== null) {
+          // TODO: compress the response with the dictionary if it is available
+          let ver = zstd.versionNumber();
+          console.log(ver);
+          response.headers.append("X-Zstd-Version", ver);
+        } else {
+          console.log("zstd is null");
+        }
 
         return response;
       } else {
@@ -92,10 +100,6 @@ async function fetchDictionary(request, env) {
       } else {
         dictionary = false;
       }
-
-      // init zstandard
-      await zstd_init();
-
       resolve(true);
     } else {
       await dictionaryPromise;
@@ -114,6 +118,7 @@ async function zstd_init() {
   // `wasm` as that is the name Wrangler uses
   // for any uploaded wasm module
   if (!zstd) {
+    console.log("Initializing zstd");
     zstd = await zstdlib({
       instantiateWasm(info, receive) {
         console.log("instantiateWasm");
