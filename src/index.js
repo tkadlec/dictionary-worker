@@ -1,21 +1,28 @@
 import zstdlib from "../zstd-wasm-compress/bin/zstdlib.js";
 import zstdwasm from "../zstd-wasm-compress/bin/zstdlib.wasm";
 
-// Keep a global instance of the zstd wasm to use across requests
-let zstd = null;
-
 // File name of the current dictionary asset (TODO: see if there is a way to get this dynamically)
 const currentDictionary = "HWl0A6pNEHO4AeCdArQj53JlvZKN8Fcwk3JcGv3tak8";
+const currentHash = atob(currentDictionary.replaceAll('-', '+').replaceAll('_', '/'));
 
 // Psuedo-path where the dictionaries will be served from (shouldn't collide with a real directory)
 const dictionaryPath = "/dictionary/";
+const dictionaryPathname = dictionaryPath + currentDictionary + '.dat';
 
 // Match pattern for the URLs to be compressed
 const match = 'match="/*", match-dest=("document" "frame")';
 
-// Globals for managing state while waiting for the dictionary to load
-let dictionaryPromise = null;
+const dictionaryExpiration = 30 * 24 * 3600;  // 30 day expiration on the dictionary itself
+
+// Block requests on dictionary and zstd being loaded?
+const blocking = false;
+
+// Globals for managing state while waiting for the dictionary and zstd wasm to load
 let dictionary = null;
+let zstd = null;
+let dictionaryLoaded = null;
+let zstdLoaded = null;
+
 
 export default {
 
@@ -28,51 +35,34 @@ export default {
       * If the request has an "Available-Dictionary" request header that matches the current dictionary then dictionary-compress the response.
     - Otherwise, pass the fetch through to the origin.
   */
-  async fetch(request, env) {
-    // make sure the dictionary is loaded
-    await fetchDictionary(request, env);
+  async fetch(request, env, ctx) {
+    // Trigger the async dictionary load and zstd init
+    dictionaryInit(request, env, ctx);
+    zstdInit(ctx);
 
     // Handle the request for the dictionary itself
-    const dictionaryPathname = dictionaryPath + currentDictionary + '.dat';
     const url = new URL(request.url);
     const isDictionary = url.pathname == dictionaryPathname;
     if (isDictionary) {
-      let body = dictionary;
-      if (body === null) {
-        url.pathname = '/' + currentDictionary + '.dat';
-        let dict = await env.ASSETS.fetch(url);
-        body = dict.body;
-      }
-      return new Response(body, {
-        headers: {
-          "content-type": "text/plain; charset=UTF-8",  /* Can be anything but text/plain will allow for Cloudflare to apply compression */
-          "cache-control": "public, max-age=604800",
-          "use-as-dictionary": match
-        }
-      });
-
+      return await fetchDictionary(env, url);
     } else {
-      // Pass the request through to the origin
       const original = await fetch(request);
 
       const dest = request.headers.get("sec-fetch-dest");
       if (dest && (dest.indexOf("document") !== -1 || dest.indexOf("frame") !== -1)) {
-        // Handle document (and frame) requests which need the link header added and
-        // may need to be dictionary-compressed if the client announces support.
-        const response = new Response(original.body, original);
-        response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
-
-        await zstd_init();
-        if (zstd !== null) {
-          // TODO: compress the response with the dictionary if it is available
-          let ver = zstd.versionNumber();
-          console.log(ver);
-          response.headers.append("X-Zstd-Version", ver);
-        } else {
-          console.log("zstd is null");
+        // block on the dictionary/zstd init if necessary
+        if (blocking) {
+          if (zstd === null) { await zstdLoaded; }
+          if (dictionary === null) { await dictionaryLoaded; }
         }
 
-        return response;
+        if (supportsCompression(request) && zstd !== null && dictionary !== null) {
+          return compressResponse(original);
+        } else {
+          const response = new Response(original.body, original);
+          response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
+          return response;
+        }
       } else {
         return original;
       }
@@ -81,35 +71,88 @@ export default {
 }
 
 /*
+  Dictionary-compress the response
+*/
+function compressResponse(original) {
+  // TODO: compress the response with the dictionary
+  const { readable, writable } = new TransformStream({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+    },
+  });
+
+  // Send the original response through the transform stream
+  original.body.pipeTo(writable);
+
+  // Add the appropriate headers
+  const response = new Response(readable, original);
+  let ver = zstd.versionNumber();
+  response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
+  response.headers.set("X-Zstd-Version", ver);
+  response.headers.set("Vary", 'Accept-Encoding, Available-Dictionary',);
+  return response;
+}
+
+/*
+ Handle the client request for a dictionary
+*/
+async function fetchDictionary(env, url) {
+  // Just pass the request through to the assets fetch
+  url.pathname = '/' + currentDictionary + '.dat';
+  let asset = await env.ASSETS.fetch(url);
+  return new Response(asset.body, {
+    headers: {
+      "content-type": "text/plain; charset=UTF-8",  /* Can be anything but text/plain will allow for Cloudflare to apply compression */
+      "cache-control": "public, max-age=" + dictionaryExpiration,
+      "use-as-dictionary": match
+    }
+  });
+}
+
+/*
+ See if the client advertized a matching dictionary and the appropriate encoding
+*/
+function supportsCompression(request) {
+  let hasDictionary = false;
+  const availableDictionary = request.headers.get("available-dictionary");
+  if (availableDictionary) {
+    const availableHash = atob(availableDictionary.trim().replaceAll(':', ''));
+    if (availableHash == currentHash) {
+      hasDictionary = true;
+    }
+  }
+  const supportsDCZ = request.cf.clientAcceptEncoding.indexOf("dcz") !== -1;
+  return hasDictionary && supportsDCZ;
+}
+
+/*
   Make sure the dictionary is loaded and cached into the isolate global.
   The current implementation blocks all requests until the dictionary has been loaded.
   This can be modified to fail fast and only use dictionaries after they have loaded.
  */
-async function fetchDictionary(request, env) {
-  if (dictionary === null) {
-    if (dictionaryPromise === null) {
-      let resolve;
-      dictionaryPromise = new Promise((res, rej) => {
-        resolve = res;
-      });
-      const url = new URL(request.url);
-      url.pathname = '/' + currentDictionary + '.dat';
-      const response = await env.ASSETS.fetch(url);
-      if (response.ok) {
-        dictionary = await response.arrayBuffer();
-      } else {
-        dictionary = false;
-      }
-      resolve(true);
+async function dictionaryInit(request, env, ctx) {
+  if (dictionary === null && dictionaryLoaded === null) {
+    let resolve;
+    dictionaryLoaded = new Promise((res, rej) => {
+      resolve = res;
+    });
+    // Keep the request alive until the dictionary loads
+    ctx.waitUntil(dictionaryLoaded);
+    const url = new URL(request.url);
+    url.pathname = '/' + currentDictionary + '.dat';
+    const response = await env.ASSETS.fetch(url);
+    if (response.ok) {
+      dictionary = await response.arrayBuffer();
     } else {
-      await dictionaryPromise;
+      dictionary = false;
     }
+    resolve(true);
   }
   return dictionary !== null;
 }
 
 // wasm setup
-async function zstd_init() {
+async function zstdInit(ctx) {
   // we send our own instantiateWasm function
   // to the zstdlib module
   // so we can initialize the WASM instance ourselves
@@ -117,8 +160,14 @@ async function zstd_init() {
   // as a binding. In this case, this binding is called
   // `wasm` as that is the name Wrangler uses
   // for any uploaded wasm module
-  if (!zstd) {
+  if (zstd === null && zstdLoaded === null) {
     console.log("Initializing zstd");
+    let resolve;
+    zstdLoaded = new Promise((res, rej) => {
+      resolve = res;
+    });
+    // Keep the request alive until zstd finished initializing
+    ctx.waitUntil(zstdLoaded);
     zstd = await zstdlib({
       instantiateWasm(info, receive) {
         console.log("instantiateWasm");
@@ -133,5 +182,7 @@ async function zstd_init() {
         return path
       },
     });
+    resolve(true);
   }
+  return zstd !== null;
 }
