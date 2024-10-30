@@ -57,7 +57,7 @@ export default {
         }
 
         if (supportsCompression(request) && zstd !== null && dictionary !== null) {
-          return compressResponse(original);
+          return compressResponse(original, ctx);
         } else {
           const response = new Response(original.body, original);
           response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
@@ -73,16 +73,10 @@ export default {
 /*
   Dictionary-compress the response
 */
-function compressResponse(original) {
-  // TODO: compress the response with the dictionary
-  const { readable, writable } = new TransformStream({
-    transform(chunk, controller) {
-      controller.enqueue(chunk);
-    },
-  });
+function compressResponse(original, ctx) {
 
-  // Send the original response through the transform stream
-  original.body.pipeTo(writable);
+  const { readable, writable } = new TransformStream();
+  ctx.waitUntil(compressStream(original.body, writable));
 
   // Add the appropriate headers
   const response = new Response(readable, original);
@@ -91,6 +85,27 @@ function compressResponse(original) {
   response.headers.set("X-Zstd-Version", ver);
   response.headers.set("Vary", 'Accept-Encoding, Available-Dictionary',);
   return response;
+}
+
+async function compressStream(readable, writable) {
+  const reader = readable.getReader();
+  const writer = writable.getWriter();
+
+  // allocate a compression context before the stream starts
+  const cctx = zstd.createCCtx();
+
+  // TODO: write dcb magic header
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    // TODO: stream-compress the chunks
+    await writer.write(value);
+  }
+
+  await writer.close();
+  zstd.freeCCtx(cctx);
 }
 
 /*
@@ -161,7 +176,6 @@ async function zstdInit(ctx) {
   // `wasm` as that is the name Wrangler uses
   // for any uploaded wasm module
   if (zstd === null && zstdLoaded === null) {
-    console.log("Initializing zstd");
     let resolve;
     zstdLoaded = new Promise((res, rej) => {
       resolve = res;
@@ -170,7 +184,6 @@ async function zstdInit(ctx) {
     ctx.waitUntil(zstdLoaded);
     zstd = await zstdlib({
       instantiateWasm(info, receive) {
-        console.log("instantiateWasm");
         let instance = new WebAssembly.Instance(zstdwasm, info);
         receive(instance);
         return instance.exports;
