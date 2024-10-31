@@ -99,11 +99,13 @@ async function compressStream(readable, writable) {
   let cctx = null;
   let zstdInBuff = null;
   let zstdOutBuff = null;
+  let inSize = 0;
+  let outSize = 0;
   try {
     cctx = zstd.createCCtx();
     if (cctx !== null) {
-      const inSize = zstd.CStreamInSize();
-      const outSize = 4096; // use a small 4kb output buffer to keep the compression responsive and avoid over-buffering
+      inSize = zstd.CStreamInSize();
+      outSize = zstd.CStreamOutSize();
       console.log("Allocating zstd buffers. in: " + inSize +", out: " + outSize);
       zstdInBuff = zstd._malloc(inSize);
       zstdOutBuff = zstd._malloc(outSize);
@@ -112,16 +114,54 @@ async function compressStream(readable, writable) {
     console.log(E);
   }
 
+  // configure the zstd parameters
+  zstd.CCtx_setParameter(cctx, zstd.cParameter.c_compressionLevel, compressionLevel);
+  zstd.CCtx_refCDict(cctx, dictionary);
+
   // TODO: write dcb magic header
+  let total = 0;
+  let totalCompressed = 0;
 
   // streaming compression modeled after https://github.com/facebook/zstd/blob/dev/examples/streaming_compression.c
   while (true) {
     const { value, done } = await reader.read();
+    const size = done ? 0 : value.byteLength;
+    total += size;
+
+    // TODO: handle the case where the chunk is larger than the zstd input buffer
+    try {
+      if (size > 0) {
+        zstd.HEAPU8.set(value, zstdInBuff);
+      }
+
+      const inBuffer = new zstd.inBuffer();
+      inBuffer.src = zstdInBuff;
+      inBuffer.size = size;
+      inBuffer.pos = 0;
+      let finished = false;
+      do {
+        const outBuffer = new zstd.outBuffer();
+        outBuffer.dst = zstdOutBuff;
+        outBuffer.size = outSize;
+        outBuffer.pos = 0;
+        let mode = done ? zstd.EndDirective.e_end : zstd.EndDirective.e_continue;
+        const remaining = zstd.compressStream2(cctx, outBuffer, inBuffer, mode);
+        totalCompressed += outBuffer.pos;
+        console.log("Chunk - original: " + inBuffer.pos + ", compressed: " + outBuffer.pos);
+
+        finished = done ? (remaining == 0) : (inBuffer.pos == inBuffer.size);
+      } while (!finished);
+    } catch (E) {
+      console.log(E);
+    }
+
     if (done) break;
 
     // TODO: stream-compress the chunks
     await writer.write(value);
   }
+
+  console.log("Stream complete. Original: " + total + ", compressed: " + totalCompressed);
 
   await writer.close();
 
@@ -226,7 +266,7 @@ function postInit() {
       // copy the dictionary over to wasm
       try {
         let dict = zstd._malloc(dictionaryJS.byteLength)
-        zstd.HEAPU8.set(dictionaryJS, dictionary);
+        zstd.HEAPU8.set(dictionaryJS, dict);
         dictionary = zstd.createCDict(dict, dictionaryJS.byteLength, compressionLevel);
         if (dictionary === null) {
           console.log('Failed to create zstd dictionary');
