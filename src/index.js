@@ -16,13 +16,17 @@ const dictionaryExpiration = 30 * 24 * 3600;  // 30 day expiration on the dictio
 
 // Block requests on dictionary and zstd being loaded?
 const blocking = false;
+const compressionLevel = 10;
 
 // Globals for managing state while waiting for the dictionary and zstd wasm to load
-let dictionary = null;
 let zstd = null;
 let dictionaryLoaded = null;
 let zstdLoaded = null;
+let initialized = false;
+let dictionary = null;
+let dictionaryJS = null;
 
+// Initialize wasm outside of a request context
 
 export default {
 
@@ -36,9 +40,9 @@ export default {
     - Otherwise, pass the fetch through to the origin.
   */
   async fetch(request, env, ctx) {
-    // Trigger the async dictionary load and zstd init
+    // Trigger the async dictionary load (has to be done in a request context to have access to env)
     dictionaryInit(request, env, ctx);
-    zstdInit(ctx);
+    zstdInit();
 
     // Handle the request for the dictionary itself
     const url = new URL(request.url);
@@ -91,11 +95,26 @@ async function compressStream(readable, writable) {
   const reader = readable.getReader();
   const writer = writable.getWriter();
 
-  // allocate a compression context before the stream starts
-  const cctx = zstd.createCCtx();
+  // allocate a compression context and buffers before the stream starts
+  let cctx = null;
+  let zstdInBuff = null;
+  let zstdOutBuff = null;
+  try {
+    cctx = zstd.createCCtx();
+    if (cctx !== null) {
+      const inSize = zstd.CStreamInSize();
+      const outSize = 4096; // use a small 4kb output buffer to keep the compression responsive and avoid over-buffering
+      console.log("Allocating zstd buffers. in: " + inSize +", out: " + outSize);
+      zstdInBuff = zstd._malloc(inSize);
+      zstdOutBuff = zstd._malloc(outSize);
+    }
+  } catch (E) {
+    console.log(E);
+  }
 
   // TODO: write dcb magic header
 
+  // streaming compression modeled after https://github.com/facebook/zstd/blob/dev/examples/streaming_compression.c
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -105,7 +124,11 @@ async function compressStream(readable, writable) {
   }
 
   await writer.close();
-  zstd.freeCCtx(cctx);
+
+  // Free the zstd context and buffers
+  if (zstdInBuff !== null) zstd._free(zstdInBuff);
+  if (zstdOutBuff !== null) zstd._free(zstdOutBuff);
+  if (cctx !== null) zstd.freeCCtx(cctx);
 }
 
 /*
@@ -146,7 +169,7 @@ function supportsCompression(request) {
   This can be modified to fail fast and only use dictionaries after they have loaded.
  */
 async function dictionaryInit(request, env, ctx) {
-  if (dictionary === null && dictionaryLoaded === null) {
+  if (dictionaryJS === null && dictionaryLoaded === null) {
     let resolve;
     dictionaryLoaded = new Promise((res, rej) => {
       resolve = res;
@@ -157,17 +180,15 @@ async function dictionaryInit(request, env, ctx) {
     url.pathname = '/' + currentDictionary + '.dat';
     const response = await env.ASSETS.fetch(url);
     if (response.ok) {
-      dictionary = await response.arrayBuffer();
-    } else {
-      dictionary = false;
+      dictionaryJS = await response.arrayBuffer();
     }
+    postInit();
     resolve(true);
   }
-  return dictionary !== null;
 }
 
 // wasm setup
-async function zstdInit(ctx) {
+async function zstdInit() {
   // we send our own instantiateWasm function
   // to the zstdlib module
   // so we can initialize the WASM instance ourselves
@@ -181,7 +202,6 @@ async function zstdInit(ctx) {
       resolve = res;
     });
     // Keep the request alive until zstd finished initializing
-    ctx.waitUntil(zstdLoaded);
     zstd = await zstdlib({
       instantiateWasm(info, receive) {
         let instance = new WebAssembly.Instance(zstdwasm, info);
@@ -195,7 +215,28 @@ async function zstdInit(ctx) {
         return path
       },
     });
+    postInit();
     resolve(true);
   }
-  return zstd !== null;
+}
+
+function postInit() {
+  if (!initialized) {
+    if (zstd !== null && dictionaryJS !== null) {
+      // copy the dictionary over to wasm
+      try {
+        let dict = zstd._malloc(dictionaryJS.byteLength)
+        zstd.HEAPU8.set(dictionaryJS, dictionary);
+        dictionary = zstd.createCDict(dict, dictionaryJS.byteLength, compressionLevel);
+        if (dictionary === null) {
+          console.log('Failed to create zstd dictionary');
+        }
+        zstd._free(dict);
+        dictionaryJS = null;  // Free the java-side dictionary memory
+        initialized = true;
+      } catch (E) {
+        console.log(E);
+      }
+    }
+  }
 }
