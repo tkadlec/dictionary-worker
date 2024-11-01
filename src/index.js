@@ -16,7 +16,8 @@ const dictionaryExpiration = 30 * 24 * 3600;  // 30 day expiration on the dictio
 
 // Block requests on dictionary and zstd being loaded?
 const blocking = false;
-const compressionLevel = 10;
+const compressionLevel = 20;
+const flushFast = false;  // set to true to flush data as it arrives (reduces compression ratio a fair bit)
 
 // Globals for managing state while waiting for the dictionary and zstd wasm to load
 let zstd = null;
@@ -24,6 +25,7 @@ let dictionaryLoaded = null;
 let zstdLoaded = null;
 let initialized = false;
 let dictionary = null;
+let dictionarySize = 0;
 let dictionaryJS = null;
 
 // Initialize wasm outside of a request context
@@ -109,18 +111,23 @@ async function compressStream(readable, writable) {
       console.log("Allocating zstd buffers. in: " + inSize +", out: " + outSize);
       zstdInBuff = zstd._malloc(inSize);
       zstdOutBuff = zstd._malloc(outSize);
+
+      // configure the zstd parameters
+      console.log("Compressing with " + dictionarySize + " byte dictionary");
+      zstd.CCtx_setParameter(cctx, zstd.cParameter.c_compressionLevel, compressionLevel);
+      zstd.CCtx_setParameter(cctx, zstd.cParameter.c_windowLog, 20 );
+      
+      let result = zstd.CCtx_refCDict(cctx, dictionary);
+      console.log("CCtx_refCDict result: " + result);
     }
   } catch (E) {
     console.log(E);
   }
 
-  // configure the zstd parameters
-  zstd.CCtx_setParameter(cctx, zstd.cParameter.c_compressionLevel, compressionLevel);
-  zstd.CCtx_refCDict(cctx, dictionary);
-
   // TODO: write dcb magic header
   let total = 0;
   let totalCompressed = 0;
+  const flushMode = flushFast ? zstd.EndDirective.e_flush : zstd.EndDirective.e_continue;
 
   // streaming compression modeled after https://github.com/facebook/zstd/blob/dev/examples/streaming_compression.c
   while (true) {
@@ -144,7 +151,7 @@ async function compressStream(readable, writable) {
         outBuffer.dst = zstdOutBuff;
         outBuffer.size = outSize;
         outBuffer.pos = 0;
-        let mode = done ? zstd.EndDirective.e_end : zstd.EndDirective.e_continue;
+        let mode = done ? zstd.EndDirective.e_end : flushMode;
         const remaining = zstd.compressStream2(cctx, outBuffer, inBuffer, mode);
         totalCompressed += outBuffer.pos;
         console.log("Chunk - original: " + inBuffer.pos + ", compressed: " + outBuffer.pos);
@@ -265,14 +272,12 @@ function postInit() {
     if (zstd !== null && dictionaryJS !== null) {
       // copy the dictionary over to wasm
       try {
-        let dict = zstd._malloc(dictionaryJS.byteLength)
-        zstd.HEAPU8.set(dictionaryJS, dict);
-        dictionary = zstd.createCDict(dict, dictionaryJS.byteLength, compressionLevel);
-        if (dictionary === null) {
-          console.log('Failed to create zstd dictionary');
-        }
-        zstd._free(dict);
-        dictionaryJS = null;  // Free the java-side dictionary memory
+        let d = zstd._malloc(dictionaryJS.byteLength)
+        dictionarySize = dictionaryJS.byteLength;
+        zstd.HEAPU8.set(dictionaryJS, d);
+        dictionaryJS = null;
+        dictionary = zstd.createCDict_byReference(d, dictionarySize, compressionLevel);
+        console.log("createCDict_byReference: " + dictionary);
         initialized = true;
       } catch (E) {
         console.log(E);
