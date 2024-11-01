@@ -26,6 +26,7 @@ let dictionarySize = 0;
 let dictionaryJS = null;
 const currentHash = atob(currentDictionary.replaceAll('-', '+').replaceAll('_', '/'));
 const dictionaryPathname = dictionaryPath + currentDictionary + '.dat';
+const dczHeader = new Uint8Array([0x5e, 0x2a, 0x4d, 0x18, 0x20, 0x00, 0x00, 0x00, ...Uint8Array.from(currentHash, c => c.charCodeAt(0))]);
 
 // Initialize wasm outside of a request context
 
@@ -88,6 +89,7 @@ async function compressResponse(original, ctx) {
   response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
   response.headers.set("X-Zstd-Version", ver);
   response.headers.set("Vary", 'Accept-Encoding, Available-Dictionary',);
+  response.headers.set("Content-Encoding", 'dcz',);
   return response;
 }
 
@@ -119,9 +121,9 @@ async function compressStream(readable, writable) {
     console.log(E);
   }
 
-  // TODO: write dcz magic header
-  let total = 0;
-  let totalCompressed = 0;
+  // write the dcz header
+  await writer.write(dczHeader);
+  
   let isFirstChunk = true;
   let chunksGathered = 0;
 
@@ -129,7 +131,6 @@ async function compressStream(readable, writable) {
   while (true) {
     const { value, done } = await reader.read();
     const size = done ? 0 : value.byteLength;
-    total += size;
 
     // Grab chunks of the input stream in case it is bigger than the zstd buffer
     let pos = 0;
@@ -171,25 +172,21 @@ async function compressStream(readable, writable) {
           if (outBuffer.pos == 0) chunksGathered++;
 
           const remaining = zstd.compressStream2(cctx, outBuffer, inBuffer, mode);
-          totalCompressed += outBuffer.pos;
-          console.log("Chunk - original: " + inBuffer.pos + ", compressed: " + outBuffer.pos);
+
+          if (outBuffer.pos > 0) {
+            const data = new Uint8Array(zstd.HEAPU8.buffer, outBuffer.dst, outBuffer.pos);
+            await writer.write(data);
+          }
 
           finished = done ? (remaining == 0) : (inBuffer.pos == inBuffer.size);
         } while (!finished);
       } catch (E) {
         console.log(E);
       }
-
       if (done) break;
     }
-
     if (done) break;
-
-    // TODO: stream-compress the chunks
-    await writer.write(value);
   }
-
-  console.log("Stream complete. Original: " + total + ", compressed: " + totalCompressed);
 
   await writer.close();
 
@@ -288,6 +285,8 @@ async function zstdInit() {
   }
 }
 
+// After both the dictionary and wasm have initialized, prepare the dictionary into zstd
+// memory so it can be reused efficiently.
 function postInit() {
   if (!initialized) {
     if (zstd !== null && dictionaryJS !== null) {
