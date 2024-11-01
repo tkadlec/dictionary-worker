@@ -3,23 +3,20 @@ import zstdwasm from "../zstd-wasm-compress/bin/zstdlib.wasm";
 
 // File name of the current dictionary asset (TODO: see if there is a way to get this dynamically)
 const currentDictionary = "HWl0A6pNEHO4AeCdArQj53JlvZKN8Fcwk3JcGv3tak8";
-const currentHash = atob(currentDictionary.replaceAll('-', '+').replaceAll('_', '/'));
 
 // Psuedo-path where the dictionaries will be served from (shouldn't collide with a real directory)
 const dictionaryPath = "/dictionary/";
-const dictionaryPathname = dictionaryPath + currentDictionary + '.dat';
 
-// Match pattern for the URLs to be compressed
-const match = 'match="/*", match-dest=("document" "frame")';
+// Dictionary options
+const match = 'match="/*", match-dest=("document" "frame")'; // Match pattern for the URLs to be compressed
+const dictionaryExpiration = 30 * 24 * 3600;                 // 30 day expiration on the dictionary itself
 
-const dictionaryExpiration = 30 * 24 * 3600;  // 30 day expiration on the dictionary itself
+// Compression options
+const blocking = true;   // Block requests until wasm and the dictionary have loaded
+const compressionLevel = 10;
+const compressionWindowLog = 20;  // Compression window should be at least as long as the dictionary + typical response - 2 ^ 20 = 1MB
 
-// Block requests on dictionary and zstd being loaded?
-const blocking = false;
-const compressionLevel = 20;
-const flushFast = false;  // set to true to flush data as it arrives (reduces compression ratio a fair bit)
-
-// Globals for managing state while waiting for the dictionary and zstd wasm to load
+// Internal globals for managing state while waiting for the dictionary and zstd wasm to load
 let zstd = null;
 let dictionaryLoaded = null;
 let zstdLoaded = null;
@@ -27,6 +24,8 @@ let initialized = false;
 let dictionary = null;
 let dictionarySize = 0;
 let dictionaryJS = null;
+const currentHash = atob(currentDictionary.replaceAll('-', '+').replaceAll('_', '/'));
+const dictionaryPathname = dictionaryPath + currentDictionary + '.dat';
 
 // Initialize wasm outside of a request context
 
@@ -43,8 +42,8 @@ export default {
   */
   async fetch(request, env, ctx) {
     // Trigger the async dictionary load (has to be done in a request context to have access to env)
-    dictionaryInit(request, env, ctx);
-    zstdInit();
+    dictionaryInit(request, env, ctx).catch(E => console.log(E));;
+    zstdInit().catch(E => console.log(E));;
 
     // Handle the request for the dictionary itself
     const url = new URL(request.url);
@@ -55,7 +54,7 @@ export default {
       const original = await fetch(request);
 
       const dest = request.headers.get("sec-fetch-dest");
-      if (dest && (dest.indexOf("document") !== -1 || dest.indexOf("frame") !== -1)) {
+      if (original.ok && dest && (dest.indexOf("document") !== -1 || dest.indexOf("frame") !== -1)) {
         // block on the dictionary/zstd init if necessary
         if (blocking) {
           if (zstd === null) { await zstdLoaded; }
@@ -63,7 +62,7 @@ export default {
         }
 
         if (supportsCompression(request) && zstd !== null && dictionary !== null) {
-          return compressResponse(original, ctx);
+          return await compressResponse(original, ctx);
         } else {
           const response = new Response(original.body, original);
           response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
@@ -79,8 +78,7 @@ export default {
 /*
   Dictionary-compress the response
 */
-function compressResponse(original, ctx) {
-
+async function compressResponse(original, ctx) {
   const { readable, writable } = new TransformStream();
   ctx.waitUntil(compressStream(original.body, writable));
 
@@ -108,17 +106,14 @@ async function compressStream(readable, writable) {
     if (cctx !== null) {
       inSize = zstd.CStreamInSize();
       outSize = zstd.CStreamOutSize();
-      console.log("Allocating zstd buffers. in: " + inSize +", out: " + outSize);
       zstdInBuff = zstd._malloc(inSize);
       zstdOutBuff = zstd._malloc(outSize);
 
       // configure the zstd parameters
-      console.log("Compressing with " + dictionarySize + " byte dictionary");
       zstd.CCtx_setParameter(cctx, zstd.cParameter.c_compressionLevel, compressionLevel);
-      zstd.CCtx_setParameter(cctx, zstd.cParameter.c_windowLog, 20 );
+      zstd.CCtx_setParameter(cctx, zstd.cParameter.c_windowLog, compressionWindowLog );
       
-      let result = zstd.CCtx_refCDict(cctx, dictionary);
-      console.log("CCtx_refCDict result: " + result);
+      zstd.CCtx_refCDict(cctx, dictionary);
     }
   } catch (E) {
     console.log(E);
@@ -127,7 +122,8 @@ async function compressStream(readable, writable) {
   // TODO: write dcb magic header
   let total = 0;
   let totalCompressed = 0;
-  const flushMode = flushFast ? zstd.EndDirective.e_flush : zstd.EndDirective.e_continue;
+  let isFirstChunk = true;
+  let chunksGathered = 0;
 
   // streaming compression modeled after https://github.com/facebook/zstd/blob/dev/examples/streaming_compression.c
   while (true) {
@@ -151,7 +147,22 @@ async function compressStream(readable, writable) {
         outBuffer.dst = zstdOutBuff;
         outBuffer.size = outSize;
         outBuffer.pos = 0;
-        let mode = done ? zstd.EndDirective.e_end : flushMode;
+
+        // Use a naive flushing strategy for now. Flush the first chunk immediately and then let zstd decide
+        // when each chunk should be emitted (likey accumulate until complete).
+        // Also, every 5 chunks that were gathered, flush irregardless.
+        let mode = zstd.EndDirective.e_continue;
+        if (done) {
+          mode = zstd.EndDirective.e_end;
+        } else if (isFirstChunk || chunksGathered >= 4) {
+          mode = zstd.EndDirective.e_flush;
+          isFirstChunk = false;
+          chunksGathered = 0;
+        }
+
+        // Keep track of the number of chunks processed where we didn't send any response.
+        if (outBuffer.pos == 0) chunksGathered++;
+
         const remaining = zstd.compressStream2(cctx, outBuffer, inBuffer, mode);
         totalCompressed += outBuffer.pos;
         console.log("Chunk - original: " + inBuffer.pos + ", compressed: " + outBuffer.pos);
@@ -227,7 +238,7 @@ async function dictionaryInit(request, env, ctx) {
     url.pathname = '/' + currentDictionary + '.dat';
     const response = await env.ASSETS.fetch(url);
     if (response.ok) {
-      dictionaryJS = await response.arrayBuffer();
+      dictionaryJS = await response.bytes();
     }
     postInit();
     resolve(true);
@@ -261,7 +272,7 @@ async function zstdInit() {
         console.log("locateFile");
         return path
       },
-    });
+    }).catch(E => console.log(E));
     postInit();
     resolve(true);
   }
@@ -277,7 +288,6 @@ function postInit() {
         zstd.HEAPU8.set(dictionaryJS, d);
         dictionaryJS = null;
         dictionary = zstd.createCDict_byReference(d, dictionarySize, compressionLevel);
-        console.log("createCDict_byReference: " + dictionary);
         initialized = true;
       } catch (E) {
         console.log(E);
