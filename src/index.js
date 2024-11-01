@@ -119,7 +119,7 @@ async function compressStream(readable, writable) {
     console.log(E);
   }
 
-  // TODO: write dcb magic header
+  // TODO: write dcz magic header
   let total = 0;
   let totalCompressed = 0;
   let isFirstChunk = true;
@@ -131,46 +131,56 @@ async function compressStream(readable, writable) {
     const size = done ? 0 : value.byteLength;
     total += size;
 
-    // TODO: handle the case where the chunk is larger than the zstd input buffer
-    try {
-      if (size > 0) {
-        zstd.HEAPU8.set(value, zstdInBuff);
-      }
+    // Grab chunks of the input stream in case it is bigger than the zstd buffer
+    let pos = 0;
+    while (pos < size || done) {
+      const endPos = Math.min(pos + inSize, size);
+      const chunkSize = done ? 0 : endPos - pos;
+      const chunk = done ? null : value.subarray(pos, endPos);
+      pos = endPos;
 
-      const inBuffer = new zstd.inBuffer();
-      inBuffer.src = zstdInBuff;
-      inBuffer.size = size;
-      inBuffer.pos = 0;
-      let finished = false;
-      do {
-        const outBuffer = new zstd.outBuffer();
-        outBuffer.dst = zstdOutBuff;
-        outBuffer.size = outSize;
-        outBuffer.pos = 0;
-
-        // Use a naive flushing strategy for now. Flush the first chunk immediately and then let zstd decide
-        // when each chunk should be emitted (likey accumulate until complete).
-        // Also, every 5 chunks that were gathered, flush irregardless.
-        let mode = zstd.EndDirective.e_continue;
-        if (done) {
-          mode = zstd.EndDirective.e_end;
-        } else if (isFirstChunk || chunksGathered >= 4) {
-          mode = zstd.EndDirective.e_flush;
-          isFirstChunk = false;
-          chunksGathered = 0;
+      try {
+        if (chunkSize > 0) {
+          zstd.HEAPU8.set(chunk, zstdInBuff);
         }
 
-        // Keep track of the number of chunks processed where we didn't send any response.
-        if (outBuffer.pos == 0) chunksGathered++;
+        const inBuffer = new zstd.inBuffer();
+        inBuffer.src = zstdInBuff;
+        inBuffer.size = chunkSize;
+        inBuffer.pos = 0;
+        let finished = false;
+        do {
+          const outBuffer = new zstd.outBuffer();
+          outBuffer.dst = zstdOutBuff;
+          outBuffer.size = outSize;
+          outBuffer.pos = 0;
 
-        const remaining = zstd.compressStream2(cctx, outBuffer, inBuffer, mode);
-        totalCompressed += outBuffer.pos;
-        console.log("Chunk - original: " + inBuffer.pos + ", compressed: " + outBuffer.pos);
+          // Use a naive flushing strategy for now. Flush the first chunk immediately and then let zstd decide
+          // when each chunk should be emitted (likey accumulate until complete).
+          // Also, every 5 chunks that were gathered, flush irregardless.
+          let mode = zstd.EndDirective.e_continue;
+          if (done) {
+            mode = zstd.EndDirective.e_end;
+          } else if (isFirstChunk || chunksGathered >= 4) {
+            mode = zstd.EndDirective.e_flush;
+            isFirstChunk = false;
+            chunksGathered = 0;
+          }
 
-        finished = done ? (remaining == 0) : (inBuffer.pos == inBuffer.size);
-      } while (!finished);
-    } catch (E) {
-      console.log(E);
+          // Keep track of the number of chunks processed where we didn't send any response.
+          if (outBuffer.pos == 0) chunksGathered++;
+
+          const remaining = zstd.compressStream2(cctx, outBuffer, inBuffer, mode);
+          totalCompressed += outBuffer.pos;
+          console.log("Chunk - original: " + inBuffer.pos + ", compressed: " + outBuffer.pos);
+
+          finished = done ? (remaining == 0) : (inBuffer.pos == inBuffer.size);
+        } while (!finished);
+      } catch (E) {
+        console.log(E);
+      }
+
+      if (done) break;
     }
 
     if (done) break;
