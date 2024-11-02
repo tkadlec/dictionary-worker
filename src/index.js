@@ -2,13 +2,13 @@ import zstdlib from "../zstd-wasm-compress/bin/zstdlib.js";
 import zstdwasm from "../zstd-wasm-compress/bin/zstdlib.wasm";
 
 // File name of the current dictionary asset (TODO: see if there is a way to get this dynamically)
-const currentDictionary = "HWl0A6pNEHO4AeCdArQj53JlvZKN8Fcwk3JcGv3tak8";
+const currentDictionary = "Yu5Mly7MyX8QiEl-NuhjlRgy-FdDzBNqDYXSygasUyc";
 
 // Psuedo-path where the dictionaries will be served from (shouldn't collide with a real directory)
 const dictionaryPath = "/dictionary/";
 
 // Dictionary options
-const match = 'match="/*", match-dest=("document" "frame")'; // Match pattern for the URLs to be compressed
+const match = 'match="/*.js", match-dest="script"'; // Match pattern for the URLs to be compressed
 const dictionaryExpiration = 30 * 24 * 3600;                 // 30 day expiration on the dictionary itself
 
 // Compression options
@@ -42,20 +42,47 @@ export default {
     - Otherwise, pass the fetch through to the origin.
   */
   async fetch(request, env, ctx) {
-    // Trigger the async dictionary load (has to be done in a request context to have access to env)
-    dictionaryInit(request, env, ctx).catch(E => console.log(E));;
-    zstdInit().catch(E => console.log(E));;
+    const host = request.headers.get("x-host") || new URL(request.url).hostname;
+    
+    if (!host) {
+      return await fetch(request);
+    }
 
-    // Handle the request for the dictionary itself
     const url = new URL(request.url);
+    if (!url.pathname.endsWith('.js') && !url.pathname.endsWith('.dat')) {
+      // Create a new request with the origin host
+      const originUrl = new URL(request.url);
+      originUrl.host = host;
+      return await fetch(originUrl.toString(), request);
+    }
+
+    // Initialize both in parallel
+    const [dictPromise, zstdPromise] = await Promise.all([
+      dictionaryInit(request, env, ctx),
+      zstdInit()
+    ]).catch(e => {
+      console.error("Initialization error:", e);
+      return [null, null];
+    });
+
+    // Don't modify the host if it's already different from the x-host
+    if (new URL(request.url).hostname === host) {
+      url.host = host;
+    }
+    console.log('originURL: ' + url.toString())
+
     const isDictionary = url.pathname == dictionaryPathname;
     if (isDictionary) {
       return await fetchDictionary(env, url);
     } else {
-      const original = await fetch(request);
+      console.log('origin URL: ' + url.toString())
+      const originUrl = new URL(request.url);
+      originUrl.host = host;
+      console.log('origin URL: ' + originUrl.toString())
+      const original = await fetch(originUrl.toString(), request);
 
-      const dest = request.headers.get("sec-fetch-dest");
-      if (original.ok && dest && (dest.indexOf("document") !== -1 || dest.indexOf("frame") !== -1)) {
+      // Check if the URL ends with .js regardless of the host
+      if (original.ok && url.pathname.endsWith('.js')) {
         // block on the dictionary/zstd init if necessary
         if (blocking) {
           if (zstd === null) { await zstdLoaded; }
@@ -69,9 +96,9 @@ export default {
           response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
           return response;
         }
-      } else {
-        return original;
       }
+      // Return the original response for non-js files
+      return original;
     }
   }
 }
@@ -94,112 +121,118 @@ async function compressResponse(original, ctx) {
 }
 
 async function compressStream(readable, writable) {
-  const reader = readable.getReader();
-  const writer = writable.getWriter();
+    const reader = readable.getReader();
+    const writer = writable.getWriter();
+    
+    // Add timeout handling
+    const timeout = setTimeout(() => {
+        reader.cancel();
+        writer.abort(new Error('Compression timed out'));
+    }, 25000); // 25 second timeout
 
-  // allocate a compression context and buffers before the stream starts
-  let cctx = null;
-  let zstdInBuff = null;
-  let zstdOutBuff = null;
-  let inSize = 0;
-  let outSize = 0;
-  try {
-    cctx = zstd.createCCtx();
-    if (cctx !== null) {
-      inSize = zstd.CStreamInSize();
-      outSize = zstd.CStreamOutSize();
-      zstdInBuff = zstd._malloc(inSize);
-      zstdOutBuff = zstd._malloc(outSize);
+    try {
+        // Setup compression context
+        const cctx = zstd?.createCCtx();
+        if (!cctx) throw new Error('Failed to create compression context');
 
-      // configure the zstd parameters
-      zstd.CCtx_setParameter(cctx, zstd.cParameter.c_compressionLevel, compressionLevel);
-      zstd.CCtx_setParameter(cctx, zstd.cParameter.c_windowLog, compressionWindowLog );
-      
-      zstd.CCtx_refCDict(cctx, dictionary);
-    }
-  } catch (E) {
-    console.log(E);
-  }
+        const inSize = zstd.CStreamInSize();
+        const outSize = zstd.CStreamOutSize();
+        const zstdInBuff = zstd._malloc(inSize);
+        const zstdOutBuff = zstd._malloc(outSize);
 
-  // write the dcz header
-  await writer.write(dczHeader);
-  
-  let isFirstChunk = true;
-  let chunksGathered = 0;
+        // configure the zstd parameters
+        zstd.CCtx_setParameter(cctx, zstd.cParameter.c_compressionLevel, compressionLevel);
+        zstd.CCtx_setParameter(cctx, zstd.cParameter.c_windowLog, compressionWindowLog );
+        
+        zstd.CCtx_refCDict(cctx, dictionary);
 
-  // streaming compression modeled after https://github.com/facebook/zstd/blob/dev/examples/streaming_compression.c
-  while (true) {
-    const { value, done } = await reader.read();
-    const size = done ? 0 : value.byteLength;
+        // write the dcz header
+        await writer.write(dczHeader);
+        
+        let isFirstChunk = true;
+        let chunksGathered = 0;
 
-    // Grab chunks of the input stream in case it is bigger than the zstd buffer
-    let pos = 0;
-    while (pos < size || done) {
-      const endPos = Math.min(pos + inSize, size);
-      const chunkSize = done ? 0 : endPos - pos;
-      const chunk = done ? null : value.subarray(pos, endPos);
-      pos = endPos;
+        // streaming compression modeled after https://github.com/facebook/zstd/blob/dev/examples/streaming_compression.c
+        while (true) {
+            const { value, done } = await reader.read();
+            const size = done ? 0 : value.byteLength;
 
-      try {
-        if (chunkSize > 0) {
-          zstd.HEAPU8.set(chunk, zstdInBuff);
+            // Grab chunks of the input stream in case it is bigger than the zstd buffer
+            let pos = 0;
+            while (pos < size || done) {
+                const endPos = Math.min(pos + inSize, size);
+                const chunkSize = done ? 0 : endPos - pos;
+                const chunk = done ? null : value.subarray(pos, endPos);
+                pos = endPos;
+
+                try {
+                    if (chunkSize > 0) {
+                        zstd.HEAPU8.set(chunk, zstdInBuff);
+                    }
+
+                    const inBuffer = new zstd.inBuffer();
+                    inBuffer.src = zstdInBuff;
+                    inBuffer.size = chunkSize;
+                    inBuffer.pos = 0;
+                    let finished = false;
+                    do {
+                        const outBuffer = new zstd.outBuffer();
+                        outBuffer.dst = zstdOutBuff;
+                        outBuffer.size = outSize;
+                        outBuffer.pos = 0;
+
+                        // Use a naive flushing strategy for now. Flush the first chunk immediately and then let zstd decide
+                        // when each chunk should be emitted (likey accumulate until complete).
+                        // Also, every 5 chunks that were gathered, flush irregardless.
+                        let mode = zstd.EndDirective.e_continue;
+                        if (done) {
+                            mode = zstd.EndDirective.e_end;
+                        } else if (isFirstChunk || chunksGathered >= 4) {
+                            mode = zstd.EndDirective.e_flush;
+                            isFirstChunk = false;
+                            chunksGathered = 0;
+                        }
+
+                        // Keep track of the number of chunks processed where we didn't send any response.
+                        if (outBuffer.pos == 0) chunksGathered++;
+
+                        const remaining = zstd.compressStream2(cctx, outBuffer, inBuffer, mode);
+
+                        if (outBuffer.pos > 0) {
+                            const data = new Uint8Array(zstd.HEAPU8.buffer, outBuffer.dst, outBuffer.pos);
+                            await writer.write(data);
+                        }
+
+                        finished = done ? (remaining == 0) : (inBuffer.pos == inBuffer.size);
+                    } while (!finished);
+                } catch (E) {
+                    console.log(E);
+                }
+                if (done) break;
+            }
+            if (done) break;
         }
 
-        const inBuffer = new zstd.inBuffer();
-        inBuffer.src = zstdInBuff;
-        inBuffer.size = chunkSize;
-        inBuffer.pos = 0;
-        let finished = false;
-        do {
-          const outBuffer = new zstd.outBuffer();
-          outBuffer.dst = zstdOutBuff;
-          outBuffer.size = outSize;
-          outBuffer.pos = 0;
+        await writer.close();
 
-          // Use a naive flushing strategy for now. Flush the first chunk immediately and then let zstd decide
-          // when each chunk should be emitted (likey accumulate until complete).
-          // Also, every 5 chunks that were gathered, flush irregardless.
-          let mode = zstd.EndDirective.e_continue;
-          if (done) {
-            mode = zstd.EndDirective.e_end;
-          } else if (isFirstChunk || chunksGathered >= 4) {
-            mode = zstd.EndDirective.e_flush;
-            isFirstChunk = false;
-            chunksGathered = 0;
-          }
-
-          // Keep track of the number of chunks processed where we didn't send any response.
-          if (outBuffer.pos == 0) chunksGathered++;
-
-          const remaining = zstd.compressStream2(cctx, outBuffer, inBuffer, mode);
-
-          if (outBuffer.pos > 0) {
-            const data = new Uint8Array(zstd.HEAPU8.buffer, outBuffer.dst, outBuffer.pos);
-            await writer.write(data);
-          }
-
-          finished = done ? (remaining == 0) : (inBuffer.pos == inBuffer.size);
-        } while (!finished);
-      } catch (E) {
-        console.log(E);
-      }
-      if (done) break;
+        // Free the zstd context and buffers
+        if (zstdInBuff !== null) zstd._free(zstdInBuff);
+        if (zstdOutBuff !== null) zstd._free(zstdOutBuff);
+        if (cctx !== null) zstd.freeCCtx(cctx);
+    } catch (error) {
+        console.error('Compression error:', error);
+        throw error;
+    } finally {
+        clearTimeout(timeout);
     }
-    if (done) break;
-  }
-
-  await writer.close();
-
-  // Free the zstd context and buffers
-  if (zstdInBuff !== null) zstd._free(zstdInBuff);
-  if (zstdOutBuff !== null) zstd._free(zstdOutBuff);
-  if (cctx !== null) zstd.freeCCtx(cctx);
 }
 
 /*
  Handle the client request for a dictionary
 */
 async function fetchDictionary(env, url) {
+  console.log('fetching dictionary');
+  console.log('dcitionary url: ' + url);
   // Just pass the request through to the assets fetch
   url.pathname = '/' + currentDictionary + '.dat';
   let asset = await env.ASSETS.fetch(url);
@@ -234,22 +267,20 @@ function supportsCompression(request) {
   This can be modified to fail fast and only use dictionaries after they have loaded.
  */
 async function dictionaryInit(request, env, ctx) {
-  if (dictionaryJS === null && dictionaryLoaded === null) {
-    let resolve;
-    dictionaryLoaded = new Promise((res, rej) => {
-      resolve = res;
-    });
-    // Keep the request alive until the dictionary loads
-    ctx.waitUntil(dictionaryLoaded);
-    const url = new URL(request.url);
-    url.pathname = '/' + currentDictionary + '.dat';
-    const response = await env.ASSETS.fetch(url);
-    if (response.ok) {
-      dictionaryJS = await response.bytes();
+    if (dictionaryJS === null && dictionaryLoaded === null) {
+        dictionaryLoaded = Promise.resolve().then(async () => {
+            const url = new URL(request.url);
+            url.pathname = '/' + currentDictionary + '.dat';
+            const response = await env.ASSETS.fetch(url);
+            if (!response.ok) {
+                throw new Error('Failed to load dictionary');
+            }
+            dictionaryJS = await response.bytes();
+            postInit();
+            return true;
+        });
     }
-    postInit();
-    resolve(true);
-  }
+    return dictionaryLoaded;
 }
 
 // wasm setup
