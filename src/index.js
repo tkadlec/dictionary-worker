@@ -89,7 +89,7 @@ export default {
           if (dictionary === null) { await dictionaryLoaded; }
         }
         console.log('supports compression ' + supportsCompression(request));
-        console.log('ztsd', zstd);
+        console.log('zstd', zstd);
         console.log('dictionary', dictionary);
 
         if (supportsCompression(request) && zstd !== null && dictionary !== null) {
