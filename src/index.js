@@ -90,8 +90,10 @@ export default {
         }
 
         if (supportsCompression(request) && zstd !== null && dictionary !== null) {
+          console.log('yup...supports compression')
           return await compressResponse(original, ctx);
         } else {
+          console.log("nope...not gonna compress for some reason")
           const response = new Response(original.body, original);
           response.headers.append("Link", '<' + dictionaryPathname + '>; rel="compression-dictionary"',);
           return response;
