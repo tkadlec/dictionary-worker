@@ -8,7 +8,7 @@ const currentDictionary = "Yu5Mly7MyX8QiEl-NuhjlRgy-FdDzBNqDYXSygasUyc";
 const dictionaryPath = "/dictionary/";
 
 // Dictionary options
-const match = 'match="/*.js", match-dest="script"'; // Match pattern for the URLs to be compressed
+const match = 'match="/*.js", match-dest=("script")'; // Match pattern for the URLs to be compressed
 const dictionaryExpiration = 30 * 24 * 3600;                 // 30 day expiration on the dictionary itself
 
 // Compression options
@@ -46,6 +46,14 @@ export default {
     
     if (!host) {
       return await fetch(request);
+    }
+
+    // Add check for the new header
+    const useDictionary = request.headers.get("X-Use-Dictionary") === "true";
+    if (!useDictionary) {
+      const originUrl = new URL(request.url);
+      originUrl.host = host;
+      return await fetch(originUrl.toString(), request);
     }
 
     const url = new URL(request.url);
